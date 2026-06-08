@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:provider/provider.dart';
@@ -12,6 +13,8 @@ import '../services/obd_simulator.dart';
 import '../services/obd_service.dart';
 import '../services/map_service.dart';
 import '../services/voice_assistant_service.dart';
+import '../services/gemini_service.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../widgets/gauge_painter.dart';
 
 class DashboardScreen extends StatefulWidget {
@@ -35,6 +38,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   int _selectedIndex = 0;
   int _rightPanelTabIndex = 0;
   bool _isVoiceWelcomeVisible = true;
+  bool _isNavigationActive = false;
 
   @override
   void initState() {
@@ -200,6 +204,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         return VoiceAssistantSheet(
           state: state,
           voiceService: _voiceService,
+          mapService: _mapService,
           onStartTrip: (response) {
             _startController.text = "Bangkok";
             _destController.text = response.destination;
@@ -335,19 +340,40 @@ class _DashboardScreenState extends State<DashboardScreen> {
       Widget activeBody;
       switch (_selectedIndex) {
         case 0:
-          activeBody = _buildMapPanel(state);
+          activeBody = GeminiVoicePortal(
+            state: state,
+            voiceService: _voiceService,
+            mapService: _mapService,
+            onStartTrip: (response) {
+              setState(() {
+                _isNavigationActive = true;
+                _isVoiceWelcomeVisible = false;
+                _selectedIndex = 1; // Switch to Map Tab!
+              });
+              _startController.text = "Bangkok";
+              _destController.text = response.destination;
+              state.setFuelLevelDirect(response.initialBattery);
+              _onCalculateRoute(state);
+              if (!state.isSimulatorMode) {
+                state.setConnectionMode(simulator: true);
+              }
+            },
+          );
           break;
         case 1:
+          activeBody = _buildMapPanel(state);
+          break;
+        case 2:
           activeBody = SingleChildScrollView(
             child: _buildTelemetryPanel(state),
           );
           break;
-        case 2:
+        case 3:
           activeBody = SingleChildScrollView(
             child: _buildDiagnosticsPanel(state),
           );
           break;
-        case 3:
+        case 4:
           activeBody = SingleChildScrollView(
             child: _buildVehicleProfilePanel(state),
           );
@@ -372,6 +398,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
             });
           },
           items: [
+            BottomNavigationBarItem(
+              icon: const Icon(Icons.mic),
+              label: state.language == 'th' ? "คำสั่งเสียง" : "Voice Control",
+            ),
             BottomNavigationBarItem(
               icon: const Icon(Icons.map),
               label: state.text('map_tab'),
@@ -632,6 +662,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     return AppBar(
       backgroundColor: Colors.white,
+      leading: _isNavigationActive ? IconButton(
+        icon: const Icon(Icons.arrow_back),
+        onPressed: () {
+          setState(() {
+            _isNavigationActive = false;
+            _selectedIndex = 0; // Go back to Voice Control tab
+          });
+        },
+        tooltip: "Back to Assistant",
+      ) : null,
       title: titleWidget,
       actions: actionsList,
     );
@@ -2681,12 +2721,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
 class VoiceAssistantSheet extends StatefulWidget {
   final OBDState state;
   final VoiceAssistantService voiceService;
+  final MapService mapService;
   final Function(VoiceAssistantResponse response) onStartTrip;
 
   const VoiceAssistantSheet({
     super.key,
     required this.state,
     required this.voiceService,
+    required this.mapService,
     required this.onStartTrip,
   });
 
@@ -2734,11 +2776,15 @@ class _VoiceAssistantSheetState extends State<VoiceAssistantSheet> with SingleTi
       _status = "thinking";
     });
 
-    // Simulate AI parsing delay
-    await Future.delayed(const Duration(milliseconds: 1200));
+    // Call dynamic OSRM/Nominatim API
+    final res = await widget.voiceService.parseCommand(
+      query,
+      widget.state.language,
+      widget.mapService,
+      widget.state,
+    );
 
     if (!mounted) return;
-    final res = widget.voiceService.parseCommand(query, widget.state.language);
     setState(() {
       _status = "responding";
       _response = res;
@@ -3156,6 +3202,1077 @@ class _VoiceAssistantSheetState extends State<VoiceAssistantSheet> with SingleTi
           style: TextStyle(
             color: color ?? Colors.white,
             fontSize: 12,
+            fontWeight: FontWeight.bold,
+            fontFamily: 'Space Grotesk',
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class GeminiVoicePortal extends StatefulWidget {
+  final OBDState state;
+  final VoiceAssistantService voiceService;
+  final MapService mapService;
+  final Function(VoiceAssistantResponse response) onStartTrip;
+
+  const GeminiVoicePortal({
+    super.key,
+    required this.state,
+    required this.voiceService,
+    required this.mapService,
+    required this.onStartTrip,
+  });
+
+  @override
+  State<GeminiVoicePortal> createState() => _GeminiVoicePortalState();
+}
+
+class _GeminiVoicePortalState extends State<GeminiVoicePortal> with SingleTickerProviderStateMixin {
+  String _speechText = "";
+  String _status = "idle"; // idle, listening, thinking, responding, confirming, listeningConfirmation
+  VoiceAssistantResponse? _response;
+  late AnimationController _pulseController;
+  final TextEditingController _textController = TextEditingController();
+  final stt.SpeechToText _speechToText = stt.SpeechToText();
+  bool _speechEnabled = false;
+  String? _pendingDestination;
+  String? _pendingFullQuery;
+  final GeminiService _geminiService = GeminiService();
+  String _geminiApiKey = "";
+
+  @override
+  void initState() {
+    super.initState();
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1500),
+    )..repeat();
+    _loadApiKey();
+    _initSpeech();
+  }
+
+  void _loadApiKey() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _geminiApiKey = prefs.getString('gemini_api_key') ?? "AIzaSyAli_2myS0sbgoa5MoAi-yoqgDTQnStA_A";
+    });
+  }
+
+  void _showApiKeyDialog() {
+    final controller = TextEditingController(text: _geminiApiKey);
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        final isThai = widget.state.language == 'th';
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1E222A),
+          title: Text(
+            isThai ? "ตั้งค่า Gemini API Key" : "Set Gemini API Key",
+            style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+          ),
+          content: TextField(
+            controller: controller,
+            obscureText: true,
+            style: const TextStyle(color: Colors.white, fontSize: 14),
+            decoration: InputDecoration(
+              hintText: "AIza...",
+              hintStyle: const TextStyle(color: Colors.white30, fontSize: 12),
+              filled: true,
+              fillColor: Colors.white.withOpacity(0.04),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+                borderSide: BorderSide(color: Colors.white.withOpacity(0.1)),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: Text(isThai ? "ยกเลิก" : "Cancel", style: const TextStyle(color: Colors.white54)),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
+              onPressed: () async {
+                final key = controller.text.trim();
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.setString('gemini_api_key', key);
+                setState(() {
+                  _geminiApiKey = key;
+                });
+                if (mounted) {
+                  Navigator.pop(ctx);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(isThai ? "บันทึกคีย์เรียบร้อยแล้ว" : "API Key saved successfully."),
+                      duration: const Duration(seconds: 1),
+                    ),
+                  );
+                }
+              },
+              child: Text(isThai ? "บันทึก" : "Save", style: const TextStyle(color: Colors.white)),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _initSpeech() async {
+    try {
+      final available = await _speechToText.initialize(
+        onError: (val) {
+          debugPrint("Speech Error: $val");
+          setState(() {
+            _status = "idle";
+          });
+        },
+        onStatus: (val) {
+          debugPrint("Speech Status: $val");
+          if (val == "done" || val == "notListening") {
+            if (_status == "listening") {
+              if (_speechText.trim().isNotEmpty) {
+                _triggerVoiceCommand(_speechText);
+              } else {
+                setState(() {
+                  _status = "idle";
+                });
+              }
+            } else if (_status == "listeningConfirmation") {
+              if (_speechText.trim().isNotEmpty) {
+                _handleConfirmationSpoken(_speechText);
+              } else {
+                // If they didn't speak, keep confirming state or reset
+              }
+            }
+          }
+        },
+      );
+      setState(() {
+        _speechEnabled = available;
+      });
+    } catch (e) {
+      debugPrint("Speech initialization failed: $e");
+    }
+  }
+
+  void _toggleListening() async {
+    if (_status == "listening") {
+      await _speechToText.stop();
+      if (_speechText.trim().isNotEmpty) {
+        _triggerVoiceCommand(_speechText);
+      } else {
+        setState(() {
+          _status = "idle";
+        });
+      }
+    } else if (_status == "listeningConfirmation") {
+      await _speechToText.stop();
+      if (_speechText.trim().isNotEmpty) {
+        _handleConfirmationSpoken(_speechText);
+      }
+    } else {
+      if (!_speechEnabled) {
+        try {
+          final available = await _speechToText.initialize(
+            onError: (val) {
+              debugPrint("Speech Error: $val");
+              setState(() {
+                _status = "idle";
+              });
+            },
+            onStatus: (val) {
+              debugPrint("Speech Status: $val");
+              if (val == "done" || val == "notListening") {
+                if (_status == "listening") {
+                  if (_speechText.trim().isNotEmpty) {
+                    _triggerVoiceCommand(_speechText);
+                  } else {
+                    setState(() {
+                      _status = "idle";
+                    });
+                  }
+                } else if (_status == "listeningConfirmation") {
+                  if (_speechText.trim().isNotEmpty) {
+                    _handleConfirmationSpoken(_speechText);
+                  }
+                }
+              }
+            },
+          );
+          setState(() {
+            _speechEnabled = available;
+          });
+        } catch (e) {
+          debugPrint("Speech re-init failed: $e");
+        }
+      }
+
+      if (!_speechEnabled) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(widget.state.language == 'th'
+                ? "ไม่สามารถใช้งานคำสั่งเสียงได้ กรุณาพิมพ์แทน"
+                : "Speech recognition unavailable. Please type your command."),
+          ),
+        );
+        _showQueryInput();
+        return;
+      }
+
+      setState(() {
+        _status = "listening";
+        _speechText = "";
+        _response = null;
+      });
+
+      await _speechToText.listen(
+        onResult: (result) {
+          setState(() {
+            _speechText = result.recognizedWords;
+          });
+        },
+        localeId: widget.state.language == 'th' ? 'th-TH' : 'en-US',
+        listenFor: const Duration(seconds: 30),
+        pauseFor: const Duration(seconds: 3),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    _pulseController.dispose();
+    _textController.dispose();
+    widget.voiceService.stop();
+    _speechToText.stop();
+    super.dispose();
+  }
+
+  void _triggerVoiceCommand(String query) async {
+    if (query.trim().isEmpty) return;
+
+    final dest = widget.voiceService.parseDestinationName(query, widget.state.language);
+    setState(() {
+      _pendingDestination = dest;
+      _pendingFullQuery = query;
+      _status = "confirming";
+      _response = null;
+    });
+
+    final isThai = widget.state.language == 'th';
+    final text = isThai
+        ? "คุณต้องการเดินทางไป $dest ใช่ไหมคะ?"
+        : "Do you want to navigate to $dest?";
+
+    await widget.voiceService.speak(text, widget.state.language);
+
+    if (!mounted) return;
+
+    setState(() {
+      _status = "listeningConfirmation";
+      _speechText = "";
+    });
+
+    await _speechToText.listen(
+      onResult: (result) {
+        setState(() {
+          _speechText = result.recognizedWords;
+        });
+        _handleConfirmationSpoken(result.recognizedWords);
+      },
+      localeId: widget.state.language == 'th' ? 'th-TH' : 'en-US',
+      listenFor: const Duration(seconds: 10),
+      pauseFor: const Duration(seconds: 2),
+    );
+  }
+
+  void _handleConfirmationSpoken(String text) {
+    if (_status != "listeningConfirmation") return;
+    final isThai = widget.state.language == 'th';
+    final lowerText = text.toLowerCase();
+    
+    final positiveWords = isThai
+        ? ["ใช่", "ตกลง", "ถูกต้อง", "ไปเลย", "ใช่แล้ว", "เค", "โอเค"]
+        : ["yes", "yeah", "yep", "sure", "correct", "confirm", "ok", "okay", "go"];
+    final negativeWords = isThai
+        ? ["ไม่", "ไม่ใช่", "ยกเลิก", "ไม่ไป", "หยุด"]
+        : ["no", "nope", "not", "cancel", "stop", "incorrect"];
+
+    bool confirmed = false;
+    bool cancelled = false;
+
+    for (var word in positiveWords) {
+      if (lowerText.contains(word)) {
+        confirmed = true;
+        break;
+      }
+    }
+
+    if (!confirmed) {
+      for (var word in negativeWords) {
+        if (lowerText.contains(word)) {
+          cancelled = true;
+          break;
+        }
+      }
+    }
+
+    if (confirmed) {
+      _confirmAndProceed();
+    } else if (cancelled) {
+      _cancelAndReset();
+    }
+  }
+
+  void _confirmAndProceed() async {
+    if (_pendingFullQuery == null) return;
+    final query = _pendingFullQuery!;
+    _pendingFullQuery = null;
+    _pendingDestination = null;
+
+    setState(() {
+      _status = "thinking";
+    });
+    await _speechToText.stop();
+
+    if (!mounted) return;
+
+    VoiceAssistantResponse res;
+    if (_deepSeekApiKey.isNotEmpty) {
+      try {
+        final dsRes = await _deepSeekService.queryCopilot(
+          query,
+          widget.state.language,
+          widget.state,
+          _deepSeekApiKey,
+        );
+
+        if (dsRes.destination != null) {
+          final routeRes = await widget.voiceService.parseCommand(
+            dsRes.destination!,
+            widget.state.language,
+            widget.mapService,
+            widget.state,
+          );
+          res = VoiceAssistantResponse(
+            textResponse: dsRes.textResponse,
+            destination: routeRes.destination,
+            initialBattery: routeRes.initialBattery,
+            finalBattery: routeRes.finalBattery,
+            distanceKm: routeRes.distanceKm,
+            durationHrs: routeRes.durationHrs,
+            estimatedCost: routeRes.estimatedCost,
+            recommendedStops: routeRes.recommendedStops,
+          );
+        } else {
+          res = VoiceAssistantResponse(
+            textResponse: dsRes.textResponse,
+            destination: "",
+            initialBattery: widget.state.fuelLevel,
+            finalBattery: widget.state.fuelLevel,
+            distanceKm: 0.0,
+            durationHrs: 0.0,
+            estimatedCost: 0.0,
+            recommendedStops: [],
+          );
+        }
+      } catch (e) {
+        res = VoiceAssistantResponse(
+          textResponse: widget.state.language == 'th'
+              ? "เกิดข้อผิดพลาดในการประมวลผล DeepSeek: $e"
+              : "Error processing DeepSeek API: $e",
+          destination: "",
+          initialBattery: widget.state.fuelLevel,
+          finalBattery: widget.state.fuelLevel,
+          distanceKm: 0.0,
+          durationHrs: 0.0,
+          estimatedCost: 0.0,
+          recommendedStops: [],
+        );
+      }
+    } else {
+      res = await widget.voiceService.parseCommand(
+        query,
+        widget.state.language,
+        widget.mapService,
+        widget.state,
+      );
+      // Append warning to tell the user to set their API key
+      final warning = widget.state.language == 'th'
+          ? "\n\n(คำเตือน: คุณยังไม่ได้ใส่ DeepSeek API Key ในการตั้งค่า)"
+          : "\n\n(Notice: Please configure your DeepSeek API Key in settings)";
+      res = VoiceAssistantResponse(
+        textResponse: res.textResponse + warning,
+        destination: res.destination,
+        initialBattery: res.initialBattery,
+        finalBattery: res.finalBattery,
+        distanceKm: res.distanceKm,
+        durationHrs: res.durationHrs,
+        estimatedCost: res.estimatedCost,
+        recommendedStops: res.recommendedStops,
+      );
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _status = "responding";
+      _response = res;
+    });
+
+    // Speak it out!
+    await widget.voiceService.speak(res.textResponse, widget.state.language);
+  }
+
+  void _cancelAndReset() async {
+    _pendingFullQuery = null;
+    _pendingDestination = null;
+    await _speechToText.stop();
+    setState(() {
+      _status = "idle";
+      _speechText = "";
+    });
+    final isThai = widget.state.language == 'th';
+    final cancelText = isThai ? "ยกเลิกคำสั่งเรียบร้อยค่ะ" : "Command cancelled.";
+    await widget.voiceService.speak(cancelText, widget.state.language);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = widget.state;
+    final isThai = state.language == 'th';
+
+    return Container(
+      decoration: const BoxDecoration(
+        gradient: RadialGradient(
+          center: Alignment.center,
+          radius: 1.2,
+          colors: [
+            Color(0xFF1B1D3A), // ambient purple-blue glow in center
+            Color(0xFF0A0C16), // dark space black background
+          ],
+        ),
+      ),
+      child: SafeArea(
+        child: Column(
+          children: [
+            // Top action bar (Language switch and header)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(Icons.speed, color: Colors.blueAccent, size: 20),
+                      SizedBox(width: 6),
+                      Text(
+                        "DRIVESYNC",
+                        style: TextStyle(
+                          fontFamily: 'Space Grotesk',
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                          fontSize: 14,
+                          letterSpacing: 1.0,
+                        ),
+                      ),
+                    ],
+                  ),
+                  Row(
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.settings, size: 18, color: Colors.white70),
+                        onPressed: _showApiKeyDialog,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(),
+                      ),
+                      const SizedBox(width: 12),
+                      TextButton.icon(
+                        style: TextButton.styleFrom(
+                          foregroundColor: Colors.white70,
+                          backgroundColor: Colors.white.withOpacity(0.04),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                        ),
+                        icon: const Icon(Icons.translate, size: 14, color: Colors.blueAccent),
+                        label: Text(
+                          state.language.toUpperCase(),
+                          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                        ),
+                        onPressed: () => state.toggleLanguage(),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+
+            Expanded(
+              child: Center(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 16.0),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      // If responding, show transcribed text and response card
+                      if (_status == "confirming" || _status == "listeningConfirmation") ...[
+                        Center(
+                          child: Text(
+                            isThai
+                                ? "คุณต้องการเดินทางไป\n\"$_pendingDestination\"\nใช่ไหมคะ?"
+                                : "Do you want to navigate to\n\"$_pendingDestination\"?",
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                              height: 1.5,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 30),
+                        if (_speechText.isNotEmpty) ...[
+                          Center(
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withOpacity(0.03),
+                                borderRadius: BorderRadius.circular(20),
+                                border: Border.all(color: Colors.white.withOpacity(0.06)),
+                              ),
+                              child: Text(
+                                '"$_speechText"',
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w600,
+                                  fontStyle: FontStyle.italic,
+                                  color: Colors.blueAccent,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 20),
+                        ],
+                        Center(
+                          child: _buildGeminiOrb(),
+                        ),
+                        const SizedBox(height: 8),
+                        Center(
+                          child: Text(
+                            isThai ? "กำลังฟังคำตอบของคุณ..." : "Listening for your answer...",
+                            style: const TextStyle(
+                              color: Colors.white38,
+                              fontSize: 11,
+                              fontStyle: FontStyle.italic,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 30),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            ElevatedButton.icon(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.redAccent.withOpacity(0.9),
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                              ),
+                              onPressed: _cancelAndReset,
+                              icon: const Icon(Icons.close, size: 18),
+                              label: Text(
+                                isThai ? "ไม่ใช่" : "No",
+                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                              ),
+                            ),
+                            const SizedBox(width: 20),
+                            ElevatedButton.icon(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.green,
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                              ),
+                              onPressed: _confirmAndProceed,
+                              icon: const Icon(Icons.check, size: 18),
+                              label: Text(
+                                isThai ? "ใช่" : "Yes",
+                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ] else if (_status == "responding" && _response != null) ...[
+                        if (_speechText.isNotEmpty) ...[
+                          Center(
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withOpacity(0.03),
+                                borderRadius: BorderRadius.circular(20),
+                                border: Border.all(color: Colors.white.withOpacity(0.06)),
+                              ),
+                              child: Text(
+                                '"$_speechText"',
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w600,
+                                  fontStyle: FontStyle.italic,
+                                  color: Colors.blueAccent,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 20),
+                        ],
+                        _buildResponseCard(isThai),
+                        const SizedBox(height: 20),
+                        // Reset button
+                        Center(
+                          child: TextButton.icon(
+                            style: TextButton.styleFrom(
+                              foregroundColor: Colors.white70,
+                            ),
+                            icon: const Icon(Icons.refresh, size: 18),
+                            label: Text(isThai ? "ถามใหม่อีกครั้ง" : "Start New Command"),
+                            onPressed: () {
+                              setState(() {
+                                _status = "idle";
+                                _speechText = "";
+                                _response = null;
+                              });
+                            },
+                          ),
+                        ),
+                      ] else ...[
+                        // Otherwise, show ONLY the center breathing mic orb in the center of the screen
+                        if (_status == "listening" && _speechText.isNotEmpty) ...[
+                          Center(
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withOpacity(0.03),
+                                borderRadius: BorderRadius.circular(20),
+                                border: Border.all(color: Colors.white.withOpacity(0.06)),
+                              ),
+                              child: Text(
+                                '"$_speechText"',
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w600,
+                                  fontStyle: FontStyle.italic,
+                                  color: Colors.blueAccent,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 20),
+                        ],
+                        const SizedBox(height: 40),
+                        Center(
+                          child: _buildGeminiOrb(),
+                        ),
+                        const SizedBox(height: 24),
+                        Center(
+                          child: Text(
+                            _status == "listening"
+                                ? (isThai ? "กำลังฟัง... แตะเพื่อประมวลผล" : "Listening... Tap to process")
+                                : (isThai ? "แตะเพื่อพูดคุย" : "Tap to Speak"),
+                            style: const TextStyle(
+                              color: Colors.white54,
+                              fontSize: 14,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 0.5,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 40),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showQueryInput() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) {
+        return Padding(
+          padding: EdgeInsets.only(
+            bottom: MediaQuery.of(ctx).viewInsets.bottom,
+          ),
+          child: Container(
+            decoration: const BoxDecoration(
+              color: Color(0xFF131524),
+              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+              boxShadow: [
+                BoxShadow(color: Colors.black54, blurRadius: 10, spreadRadius: 1)
+              ]
+            ),
+            padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 20.0),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      widget.state.language == 'th' ? "ระบุจุดหมายปลายทาง" : "Specify Destination",
+                      style: const TextStyle(
+                        fontFamily: 'Space Grotesk',
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.white54, size: 20),
+                      onPressed: () => Navigator.pop(ctx),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _textController,
+                  autofocus: true,
+                  style: const TextStyle(color: Colors.white, fontSize: 14),
+                  decoration: InputDecoration(
+                    hintText: widget.state.language == 'th' 
+                        ? "เช่น ไปชลบุรี แบตเหลือ 50%" 
+                        : "e.g., Go to Pattaya with 30% battery",
+                    hintStyle: const TextStyle(color: Colors.white30, fontSize: 13),
+                    filled: true,
+                    fillColor: Colors.white.withOpacity(0.04),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(16),
+                      borderSide: BorderSide(color: Colors.white.withOpacity(0.08)),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(16),
+                      borderSide: const BorderSide(color: Colors.blueAccent, width: 1.5),
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  ),
+                  onSubmitted: (val) {
+                    if (val.trim().isNotEmpty) {
+                      Navigator.pop(ctx);
+                      _triggerVoiceCommand(val);
+                      _textController.clear();
+                    }
+                  },
+                ),
+                const SizedBox(height: 16),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.blueAccent,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  ),
+                  onPressed: () {
+                    final val = _textController.text;
+                    if (val.trim().isNotEmpty) {
+                      Navigator.pop(ctx);
+                      _triggerVoiceCommand(val);
+                      _textController.clear();
+                    }
+                  },
+                  child: Text(
+                    widget.state.language == 'th' ? "ส่งข้อมูล" : "Submit",
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildGeminiOrb() {
+    if (_status == "idle") {
+      return AnimatedBuilder(
+        animation: _pulseController,
+        builder: (context, child) {
+          return Container(
+            width: 100,
+            height: 100,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: const RadialGradient(
+                colors: [Color(0xFF3860FF), Color(0xFF131524)],
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.blueAccent.withOpacity(0.25 + (_pulseController.value * 0.15)),
+                  blurRadius: 15 + (_pulseController.value * 15),
+                  spreadRadius: 2,
+                ),
+              ],
+            ),
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                customBorder: const CircleBorder(),
+                onTap: _toggleListening,
+                child: const Icon(Icons.mic, color: Colors.white, size: 42),
+              ),
+            ),
+          );
+        },
+      );
+    }
+
+    if (_status == "listening" || _status == "listeningConfirmation") {
+      return GestureDetector(
+        onTap: _toggleListening,
+        behavior: HitTestBehavior.opaque,
+        child: SizedBox(
+          height: 100,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: List.generate(5, (index) {
+              return AnimatedBuilder(
+                animation: _pulseController,
+                builder: (context, child) {
+                  final double phase = index * (pi / 4);
+                  final double wave = sin(_pulseController.value * 2 * pi + phase);
+                  final double height = 20 + (wave.abs() * 65);
+                  return Container(
+                    width: 8,
+                    height: height,
+                    margin: const EdgeInsets.symmetric(horizontal: 5),
+                    decoration: BoxDecoration(
+                      gradient: const LinearGradient(
+                        colors: [Colors.blueAccent, Colors.purpleAccent],
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                      ),
+                      borderRadius: BorderRadius.circular(4),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.blueAccent.withOpacity(0.3),
+                          blurRadius: 10,
+                        )
+                      ],
+                    ),
+                  );
+                },
+              );
+            }),
+          ),
+        ),
+      );
+    }
+
+    if (_status == "thinking") {
+      return SizedBox(
+        width: 100,
+        height: 100,
+        child: AnimatedBuilder(
+          animation: _pulseController,
+          builder: (context, child) {
+            return Transform.rotate(
+              angle: _pulseController.value * 2 * pi,
+              child: Container(
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: const SweepGradient(
+                    colors: [Colors.blueAccent, Colors.purpleAccent, Colors.pinkAccent, Colors.blueAccent],
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.purpleAccent.withOpacity(0.3),
+                      blurRadius: 20,
+                    )
+                  ],
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(4.0),
+                  child: Container(
+                    decoration: const BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: Color(0xFF0F111A),
+                    ),
+                    child: const Icon(Icons.psychology, color: Colors.purpleAccent, size: 38),
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      );
+    }
+
+    // responding (active speaker wave)
+    return SizedBox(
+      height: 100,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: List.generate(8, (index) {
+          return AnimatedBuilder(
+            animation: _pulseController,
+            builder: (context, child) {
+              final double phase = index * (pi / 3);
+              final double wave = sin(_pulseController.value * 3 * pi + phase);
+              final double height = 15 + (wave.abs() * 45);
+              return Container(
+                width: 5,
+                height: height,
+                margin: const EdgeInsets.symmetric(horizontal: 4),
+                decoration: BoxDecoration(
+                  color: Colors.greenAccent,
+                  borderRadius: BorderRadius.circular(3),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.greenAccent.withOpacity(0.3),
+                      blurRadius: 8,
+                    )
+                  ],
+                ),
+              );
+            },
+          );
+        }),
+      ),
+    );
+  }
+
+  Widget _buildResponseCard(bool isThai) {
+    final res = _response!;
+    final themeColor = widget.state.vehicleType == VehicleType.ev ? Colors.green : Colors.orange;
+
+    return Card(
+      color: Colors.white.withOpacity(0.04),
+      elevation: 0,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: BorderSide(color: Colors.white.withOpacity(0.08)),
+      ),
+      margin: const EdgeInsets.only(bottom: 24),
+      child: Padding(
+        padding: const EdgeInsets.all(20.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // AI Response Subtitles
+            Text(
+              res.textResponse,
+              style: const TextStyle(color: Colors.white, fontSize: 14, height: 1.4),
+            ),
+            const SizedBox(height: 20),
+            const Divider(color: Colors.white10),
+            const SizedBox(height: 12),
+
+            // Summary Info grid
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                _buildStatItem(isThai ? "จุดหมาย" : "Destination", res.destination),
+                _buildStatItem(isThai ? "ระยะทาง" : "Distance", "${res.distanceKm.round()} km"),
+                _buildStatItem(isThai ? "เวลาเดินทาง" : "Duration", "${res.durationHrs.toStringAsFixed(1)} ${isThai ? 'ชม.' : 'hrs'}"),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                _buildStatItem(isThai ? "แบตเริ่ม" : "Start SoC", "${res.initialBattery.round()}%"),
+                _buildStatItem(isThai ? "แบตปลายทาง" : "Arrival SoC", "${res.finalBattery.round()}%", color: Colors.greenAccent),
+                _buildStatItem(isThai ? "ประมาณการค่าใช้จ่าย" : "Est. Cost", "฿${res.estimatedCost.round()}"),
+              ],
+            ),
+
+            if (res.recommendedStops.isNotEmpty) ...[
+              const SizedBox(height: 20),
+              Text(
+                widget.state.text('suggested_stops'),
+                style: const TextStyle(
+                  color: Colors.white54,
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 10),
+              Column(
+                children: res.recommendedStops.map((stop) {
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 6.0),
+                    child: Row(
+                      children: [
+                        Icon(widget.state.vehicleType == VehicleType.ev ? Icons.ev_station : Icons.local_gas_station, size: 16, color: themeColor),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            stop['name']!,
+                            style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500),
+                          ),
+                        ),
+                        Text(
+                          stop['type']!,
+                          style: const TextStyle(color: Colors.white60, fontSize: 11),
+                        ),
+                      ],
+                    ),
+                  );
+                }).toList(),
+              ),
+            ],
+
+            const SizedBox(height: 24),
+            ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: themeColor,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                elevation: 0,
+              ),
+              onPressed: () {
+                widget.onStartTrip(res);
+              },
+              icon: const Icon(Icons.navigation, size: 18),
+              label: Text(
+                widget.state.text('start_nav'),
+                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStatItem(String label, String value, {Color? color}) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label.toUpperCase(),
+          style: const TextStyle(color: Colors.white30, fontSize: 9, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          value,
+          style: TextStyle(
+            color: color ?? Colors.white,
+            fontSize: 13,
             fontWeight: FontWeight.bold,
             fontFamily: 'Space Grotesk',
           ),

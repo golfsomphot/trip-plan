@@ -21,7 +21,7 @@ class DriveSyncApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'DriveSync EV - Road Trip Planner',
+      title: 'SomPhot',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.light().copyWith(
         scaffoldBackgroundColor: const Color(0xFFF6F8FA),

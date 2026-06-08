@@ -1,5 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
 import 'package:flutter_tts/flutter_tts.dart';
+import '../providers/obd_state.dart';
+import './map_service.dart';
 
 class VoiceAssistantResponse {
   final String textResponse;
@@ -76,144 +80,195 @@ class VoiceAssistantService {
     }
   }
 
-  /// Parses the user's speech command and generates a structured voice/text response.
-  VoiceAssistantResponse parseCommand(String query, String langCode) {
+  String parseDestinationName(String query, String langCode) {
+    final lowerQuery = query.toLowerCase();
+    String destination = "";
+    final thaiRegex = RegExp(r'(?:ไป|เดินทางไป)\s*([a-zA-Z0-9ก-๙\s\.\,\-]+)');
+    final engRegex = RegExp(r'(?:go to|navigate to|to)\s*([a-zA-Z0-9\s\.\,\-]+)');
+
+    var match = thaiRegex.firstMatch(query);
+    if (match != null) {
+      destination = match.group(1)!.trim();
+    } else {
+      match = engRegex.firstMatch(lowerQuery);
+      if (match != null) {
+        destination = match.group(1)!.trim();
+      } else {
+        destination = query
+            .replaceAll(RegExp(r'(?:แบต|เหลือ|battery|soc|\d+%)', caseSensitive: false), '')
+            .replaceAll(RegExp(r'[.,!?]'), '')
+            .trim();
+      }
+    }
+
+    if (destination.isEmpty) {
+      destination = langCode == 'th' ? "พัทยา" : "Pattaya";
+    }
+    return destination;
+  }
+
+  /// Parses the user's speech command asynchronously and generates a real-world route-based response.
+  Future<VoiceAssistantResponse> parseCommand(
+    String query,
+    String langCode,
+    MapService mapService,
+    OBDState state,
+  ) async {
     final lowerQuery = query.toLowerCase();
     
-    // Default values
-    String destination = "Pattaya";
-    double battery = 100.0;
-    double finalBattery = 85.0;
-    double distanceKm = 140.0;
-    double durationHrs = 1.8;
-    double cost = 120.0;
-    List<Map<String, String>> stops = [];
-    String textResponse = "";
-
-    // 1. Parse Battery level (look for numbers followed by % or preceded by battery words)
+    // 1. Parse Battery/Fuel level (default to current level from state if none parsed)
+    double battery = state.fuelLevel;
     final batteryRegex = RegExp(r'(\d+)\s*%');
-    final match = batteryRegex.firstMatch(lowerQuery);
-    if (match != null) {
-      battery = double.tryParse(match.group(1) ?? '100') ?? 100.0;
+    final matchBat = batteryRegex.firstMatch(lowerQuery);
+    if (matchBat != null) {
+      battery = double.tryParse(matchBat.group(1)!) ?? state.fuelLevel;
     } else {
-      // Look for any isolated number
       final numberRegex = RegExp(r'\b(\d+)\b');
-      final numMatches = numberRegex.allMatches(lowerQuery);
-      for (var m in numMatches) {
-        final val = double.tryParse(m.group(1) ?? '0') ?? 0;
-        if (val > 5 && val <= 100 && (lowerQuery.contains('แบต') || lowerQuery.contains('เหลือ') || lowerQuery.contains('bat') || lowerQuery.contains('soc'))) {
+      final matches = numberRegex.allMatches(lowerQuery);
+      for (var m in matches) {
+        final val = double.tryParse(m.group(1)!) ?? 0.0;
+        if (val > 0 && val <= 100 && (lowerQuery.contains('แบต') || lowerQuery.contains('เหลือ') || lowerQuery.contains('bat') || lowerQuery.contains('soc') || lowerQuery.contains('%'))) {
           battery = val;
           break;
         }
       }
     }
 
-    // 2. Parse Destination
-    if (lowerQuery.contains("เขาหลวง") || lowerQuery.contains("ตาก") || lowerQuery.contains("tak") || lowerQuery.contains("khao luang")) {
-      destination = "Khao Luang, Tak";
-      distanceKm = 470.0;
-      durationHrs = 5.5;
-      
-      if (battery >= 90) {
-        finalBattery = 22.0;
-        cost = 360.0;
-        stops = [
-          {"name": "PTT EV Station Kamphaeng Phet", "type": "120 kW CCS2"},
-        ];
-        if (langCode == 'th') {
-          textResponse = "ระยะทางไปเขาหลวง ตาก ประมาณ 470 กิโลเมตร แบตเตอรี่ปัจจุบัน $battery% แนะนำแวะชาร์จที่ PTT EV Station กำแพงเพชร 15 นาที จะถึงจุดหมายปลายทางโดยเหลือแบตเตอรี่ประมาณ 22% ค่ะ";
-        } else {
-          textResponse = "Distance to Khao Luang, Tak is 470 kilometers. With $battery% battery, we recommend charging at PTT EV Station Kamphaeng Phet for 15 minutes. You will arrive with approximately 22% battery remaining.";
-        }
-      } else if (battery >= 50) {
-        finalBattery = 15.0;
-        cost = 490.0;
-        stops = [
-          {"name": "PTT EV Station Nakhon Sawan", "type": "120 kW CCS2"},
-          {"name": "EA Anywhere Kamphaeng Phet", "type": "100 kW CCS2"},
-        ];
-        if (langCode == 'th') {
-          textResponse = "ระยะทางไปเขาหลวง ตาก ประมาณ 470 กิโลเมตร แบตเตอรี่ปัจจุบัน $battery% แนะนำแวะชาร์จ 2 จุดที่ PTT นครสวรรค์ และ EA กำแพงเพชร รวม 35 นาที จะถึงจุดหมายโดยเหลือแบตเตอรี่ประมาณ 15% ค่ะ";
-        } else {
-          textResponse = "Distance to Khao Luang, Tak is 470 kilometers. With $battery% battery, we recommend charging at PTT Nakhon Sawan and EA Kamphaeng Phet for a total of 35 minutes. You will arrive with 15% battery remaining.";
-        }
-      } else {
-        finalBattery = 12.0;
-        cost = 580.0;
-        stops = [
-          {"name": "PEA VOLTA Sing Buri", "type": "120 kW CCS2"},
-          {"name": "PTT EV Station Nakhon Sawan", "type": "120 kW CCS2"},
-          {"name": "EA Anywhere Tak", "type": "100 kW CCS2"},
-        ];
-        if (langCode == 'th') {
-          textResponse = "ระยะทางไปเขาหลวง ตาก ประมาณ 470 กิโลเมตร แบตเตอรี่ปัจจุบันน้อยเพียง $battery% แนะนำแวะชาร์จ 3 จุดที่ สิงห์บุรี, นครสวรรค์ และ ตาก รวม 50 นาที เพื่อความปลอดภัยในการเดินทางค่ะ";
-        } else {
-          textResponse = "Distance to Khao Luang, Tak is 470 kilometers. Your battery is low at $battery%. We recommend 3 charging stops at Sing Buri, Nakhon Sawan, and Tak for a total of 50 minutes to travel safely.";
-        }
-      }
-    } else if (lowerQuery.contains("เชียงใหม่") || lowerQuery.contains("chiang mai")) {
-      destination = "Chiang Mai";
-      distanceKm = 690.0;
-      durationHrs = 8.5;
-      
-      if (battery >= 80) {
-        finalBattery = 18.0;
-        cost = 680.0;
-        stops = [
-          {"name": "PTT EV Station Nakhon Sawan", "type": "150 kW CCS2"},
-          {"name": "PEA VOLTA Lampang", "type": "120 kW CCS2"},
-        ];
-        if (langCode == 'th') {
-          textResponse = "คำนวณเส้นทางไปเชียงใหม่ ระยะทาง 690 กิโลเมตร แนะนำชาร์จไฟที่ นครสวรรค์ และ ลำปาง รวม 40 นาที จะถึงปลายทางเหลือแบตเตอรี่ประมาณ 18% ค่ะ";
-        } else {
-          textResponse = "Route calculated to Chiang Mai, 690 kilometers. Recommend charging at Nakhon Sawan and Lampang for 40 minutes. You will arrive with 18% battery.";
-        }
-      } else {
-        finalBattery = 14.0;
-        cost = 820.0;
-        stops = [
-          {"name": "PEA VOLTA Sing Buri", "type": "120 kW CCS2"},
-          {"name": "PTT EV Station Kamphaeng Phet", "type": "120 kW CCS2"},
-          {"name": "PEA VOLTA Lampang", "type": "120 kW CCS2"},
-        ];
-        if (langCode == 'th') {
-          textResponse = "คำนวณเส้นทางไปเชียงใหม่ ระยะทาง 690 กิโลเมตร แบตเตอรี่ปัจจุบัน $battery% แนะนำแวะชาร์จที่ สิงห์บุรี, กำแพงเพชร และ ลำปาง รวม 55 นาที จะถึงปลายทางเหลือแบตเตอรี่ 14% ค่ะ";
-        } else {
-          textResponse = "Route calculated to Chiang Mai, 690 kilometers with $battery% battery. Recommend charging at Sing Buri, Kamphaeng Phet, and Lampang for 55 minutes. Arrive with 14% battery.";
-        }
-      }
+    // 2. Parse Destination name
+    String destination = "";
+    final thaiRegex = RegExp(r'(?:ไป|เดินทางไป)\s*([a-zA-Z0-9ก-๙\s\.\,\-]+)');
+    final engRegex = RegExp(r'(?:go to|navigate to|to)\s*([a-zA-Z0-9\s\.\,\-]+)');
+
+    var match = thaiRegex.firstMatch(query);
+    if (match != null) {
+      destination = match.group(1)!.trim();
     } else {
-      // Default to Pattaya
-      destination = "Pattaya";
+      match = engRegex.firstMatch(lowerQuery);
+      if (match != null) {
+        destination = match.group(1)!.trim();
+      } else {
+        // Fallback: strip battery info and common helper words
+        destination = query
+            .replaceAll(RegExp(r'(?:แบต|เหลือ|battery|soc|\d+%)', caseSensitive: false), '')
+            .replaceAll(RegExp(r'[.,!?]'), '')
+            .trim();
+      }
+    }
+
+    if (destination.isEmpty) {
+      destination = langCode == 'th' ? "พัทยา" : "Pattaya";
+    }
+
+    state.addLog("AI Voice Assistant: Geocoding $destination...");
+    final destLoc = await mapService.asyncGeocode(destination);
+
+    if (destLoc == null) {
+      final textResponse = langCode == 'th' 
+          ? "ขออภัยด้วยค่ะ ไม่พบข้อมูลพิกัดของ $destination กรุณาลองระบุชื่อสถานที่ใหม่อีกครั้งค่ะ"
+          : "Sorry, I couldn't find coordinates for $destination. Please try another location.";
+      return VoiceAssistantResponse(
+        textResponse: textResponse,
+        destination: destination,
+        initialBattery: battery,
+        finalBattery: battery,
+        distanceKm: 0.0,
+        durationHrs: 0.0,
+        estimatedCost: 0.0,
+        recommendedStops: [],
+      );
+    }
+
+    final double destLat = destLoc['latitude'];
+    final double destLng = destLoc['longitude'];
+    final String cleanDestName = destLoc['name'];
+
+    // Start coordinates defaults to Bangkok Center
+    final startLoc = {
+      'name': 'Bangkok',
+      'latitude': 13.7563,
+      'longitude': 100.5018,
+    };
+
+    double distanceKm = 1.0;
+    double durationHrs = 0.1;
+
+    try {
+      final uri = Uri.parse(
+        'https://router.project-osrm.org/route/v1/driving/${startLoc['longitude']},${startLoc['latitude']};$destLng,$destLat?overview=false',
+      );
+      final response = await http.get(uri);
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        if (data['code'] == 'Ok' && data['routes'] != null && data['routes'].isNotEmpty) {
+          final route = data['routes'][0];
+          final double distanceMeters = double.parse(route['distance'].toString());
+          final double durationSeconds = double.parse(route['duration'].toString());
+          distanceKm = distanceMeters / 1000.0;
+          durationHrs = durationSeconds / 3600.0;
+        }
+      }
+    } catch (e) {
+      // Fallback distance estimation
       distanceKm = 140.0;
       durationHrs = 1.8;
-      
-      if (battery >= 40) {
-        finalBattery = battery - 32;
-        cost = 90.0;
-        stops = [];
-        if (langCode == 'th') {
-          textResponse = "ระยะทางไปพัทยา 140 กิโลเมตร แแบตเตอรี่ปัจจุบัน $battery% เพียงพอสำหรับเดินทางโดยไม่ต้องแวะชาร์จ จะถึงปลายทางโดยเหลือแบตเตอรี่ประมาณ ${finalBattery.round()}% ค่ะ";
-        } else {
-          textResponse = "Distance to Pattaya is 140 kilometers. With $battery% battery, you can reach it directly without charging. You will arrive with ${finalBattery.round()}% battery remaining.";
-        }
+    }
+
+    // 3. SoC/Fuel and cost calculations based on vehicle profiles
+    final isEv = state.vehicleType == VehicleType.ev;
+    double finalBattery = battery;
+    double cost = 0.0;
+    List<Map<String, String>> stops = [];
+
+    if (isEv) {
+      final double totalWhNeeded = distanceKm * state.evEfficiency;
+      final double batteryKwh = state.batteryCapacity;
+      final double percentUsed = (totalWhNeeded / 1000.0 / batteryKwh) * 100.0;
+      finalBattery = battery - percentUsed;
+      cost = state.getEstimatedTripCost(VehicleType.ev, distanceKm * 1000.0);
+
+      if (finalBattery < 15.0) {
+        final double safeDistance = ((battery - 15.0) / 100.0) * (batteryKwh * 1000.0 / state.evEfficiency);
+        stops.add({
+          "name": "PTT EV Station (${safeDistance > 10 ? safeDistance.round() : 50} km)",
+          "type": "120 kW CCS2 Supercharger"
+        });
+        finalBattery = 35.0; // simulated state post-charge
+      }
+    } else {
+      final double litersNeeded = distanceKm / state.iceEfficiency;
+      final double percentUsed = (litersNeeded / state.fuelTankCapacity) * 100.0;
+      finalBattery = battery - percentUsed;
+      cost = state.getEstimatedTripCost(VehicleType.ice, distanceKm * 1000.0);
+
+      if (finalBattery < 15.0) {
+        stops.add({
+          "name": "PTT Gas Station",
+          "type": "Refuel Stop"
+        });
+        finalBattery = 85.0;
+      }
+    }
+
+    finalBattery = finalBattery.clamp(0.0, 100.0);
+
+    String textResponse = "";
+    if (langCode == 'th') {
+      if (isEv) {
+        textResponse = "ระยะทางไป $cleanDestName ประมาณ ${distanceKm.toStringAsFixed(1)} กิโลเมตร ใช้เวลาประมาณ ${durationHrs.toStringAsFixed(1)} ชั่วโมง แบตเตอรี่ปัจจุบัน $battery% คาดว่าถึงจุดหมายจะเหลือประมาณ ${finalBattery.round()}% ${stops.isNotEmpty ? 'แนะนำแวะชาร์จที่ ' + stops.first['name']! + ' ค่ะ' : 'แบตเตอรี่เพียงพอสำหรับเดินทางตรงได้เลยค่ะ'}";
       } else {
-        finalBattery = 20.0;
-        cost = 140.0;
-        stops = [
-          {"name": "PTT EV Station Chonburi Supercharge", "type": "150 kW CCS2"}
-        ];
-        if (langCode == 'th') {
-          textResponse = "ระยะทางไปพัทยา 140 กิโลเมตร แบตเตอรี่ $battery% ไม่เพียงพอ แนะนำแวะชาร์จที่ PTT ชลบุรี 15 นาที จะถึงปลายทางเหลือแบตเตอรี่ประมาณ 20% ค่ะ";
-        } else {
-          textResponse = "Distance to Pattaya is 140 kilometers. Your battery of $battery% is insufficient. We recommend charging at PTT Chonburi for 15 minutes, arriving with 20% battery.";
-        }
+        textResponse = "ระยะทางไป $cleanDestName ประมาณ ${distanceKm.toStringAsFixed(1)} กิโลเมตร ใช้เวลาประมาณ ${durationHrs.toStringAsFixed(1)} ชั่วโมง ระดับน้ำมัน $battery% คาดว่าถึงปลายทางจะเหลือประมาณ ${finalBattery.round()}% ${stops.isNotEmpty ? 'แนะนำแวะเติมน้ำมันที่ ' + stops.first['name']! + ' ค่ะ' : 'น้ำมันเพียงพอสำหรับเดินทางได้โดยตรงค่ะ'}";
+      }
+    } else {
+      if (isEv) {
+        textResponse = "Distance to $cleanDestName is ${distanceKm.toStringAsFixed(1)} km, taking ${durationHrs.toStringAsFixed(1)} hours. Starting SoC is $battery%, and arrival SoC is estimated at ${finalBattery.round()}%. ${stops.isNotEmpty ? 'We recommend charging at ' + stops.first['name']! + '.' : 'You can reach it directly.'}";
+      } else {
+        textResponse = "Distance to $cleanDestName is ${distanceKm.toStringAsFixed(1)} km, taking ${durationHrs.toStringAsFixed(1)} hours. Starting fuel is $battery%, and arrival fuel is estimated at ${finalBattery.round()}%. ${stops.isNotEmpty ? 'We recommend refueling at ' + stops.first['name']! + '.' : 'You can reach it directly.'}";
       }
     }
 
     return VoiceAssistantResponse(
       textResponse: textResponse,
-      destination: destination,
+      destination: cleanDestName,
       initialBattery: battery,
       finalBattery: finalBattery,
       distanceKm: distanceKm,
