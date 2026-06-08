@@ -2660,6 +2660,9 @@ class _VoiceAssistantSheetState extends State<VoiceAssistantSheet> with SingleTi
           ];
 
     return Container(
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.of(context).size.height * 0.85,
+      ),
       padding: EdgeInsets.only(
         left: 20,
         right: 20,
@@ -2677,144 +2680,146 @@ class _VoiceAssistantSheetState extends State<VoiceAssistantSheet> with SingleTi
           ),
         ],
       ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // Header
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Row(
-                children: [
-                  const Icon(Icons.mic, color: Colors.blueAccent, size: 24),
-                  const SizedBox(width: 8),
-                  Text(
-                    state.text('voice_copilot'),
-                    style: const TextStyle(
-                      fontFamily: 'Space Grotesk',
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white,
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Header
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.mic, color: Colors.blueAccent, size: 24),
+                    const SizedBox(width: 8),
+                    Text(
+                      state.text('voice_copilot'),
+                      style: const TextStyle(
+                        fontFamily: 'Space Grotesk',
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                      ),
                     ),
-                  ),
-                ],
-              ),
-              IconButton(
-                icon: const Icon(Icons.close, color: Colors.white60),
-                onPressed: () {
-                  widget.voiceService.stop();
-                  Navigator.pop(context);
-                },
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          Text(
-            state.text('copilot_speech_desc'),
-            style: const TextStyle(fontSize: 12, color: Colors.white60),
-          ),
-          const SizedBox(height: 24),
-
-          // Central Wave / Visualizer
-          Center(
-            child: _buildVisualizer(),
-          ),
-          const SizedBox(height: 20),
-
-          // Speech Transcript text
-          if (_speechText.isNotEmpty) ...[
-            Center(
-              child: Text(
-                '"$_speechText"',
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.bold,
-                  fontStyle: FontStyle.italic,
-                  color: Colors.blueAccent,
+                  ],
                 ),
-              ),
+                IconButton(
+                  icon: const Icon(Icons.close, color: Colors.white60),
+                  onPressed: () {
+                    widget.voiceService.stop();
+                    Navigator.pop(context);
+                  },
+                ),
+              ],
             ),
-            const SizedBox(height: 16),
-          ],
-
-          // AI Response UI Card
-          if (_status == "responding" && _response != null) _buildResponseCard(isThai),
-
-          // Preset Chips
-          if (_status == "idle" || _status == "responding") ...[
+            const SizedBox(height: 12),
             Text(
-              state.text('presets'),
-              style: const TextStyle(
-                fontSize: 11,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 0.5,
-                color: Colors.white60,
-              ),
+              state.text('copilot_speech_desc'),
+              style: const TextStyle(fontSize: 12, color: Colors.white60),
             ),
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: presets.map((preset) {
-                return ActionChip(
-                  backgroundColor: Colors.white.withOpacity(0.06),
-                  side: BorderSide(color: Colors.white.withOpacity(0.12)),
-                  label: Text(
-                    preset,
-                    style: const TextStyle(color: Colors.white, fontSize: 12),
-                  ),
-                  onPressed: () => _triggerVoiceCommand(preset),
-                );
-              }).toList(),
+            const SizedBox(height: 24),
+
+            // Central Wave / Visualizer
+            Center(
+              child: _buildVisualizer(),
             ),
             const SizedBox(height: 20),
-          ],
 
-          // Text Input Option
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _customInputController,
-                  style: const TextStyle(color: Colors.white, fontSize: 13),
-                  decoration: InputDecoration(
-                    hintText: state.text('mic_prompt'),
-                    hintStyle: const TextStyle(color: Colors.white30, fontSize: 12),
-                    filled: true,
-                    fillColor: Colors.white.withOpacity(0.04),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide: BorderSide(color: Colors.white.withOpacity(0.1)),
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide: const BorderSide(color: Colors.blueAccent),
-                    ),
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            // Speech Transcript text
+            if (_speechText.isNotEmpty) ...[
+              Center(
+                child: Text(
+                  '"$_speechText"',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.bold,
+                    fontStyle: FontStyle.italic,
+                    color: Colors.blueAccent,
                   ),
-                  onSubmitted: (val) {
-                    _triggerVoiceCommand(val);
+                ),
+              ),
+              const SizedBox(height: 16),
+            ],
+
+            // AI Response UI Card
+            if (_status == "responding" && _response != null) _buildResponseCard(isThai),
+
+            // Preset Chips
+            if (_status == "idle" || _status == "responding") ...[
+              Text(
+                state.text('presets'),
+                style: const TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.5,
+                  color: Colors.white60,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: presets.map((preset) {
+                  return ActionChip(
+                    backgroundColor: Colors.white.withOpacity(0.06),
+                    side: BorderSide(color: Colors.white.withOpacity(0.12)),
+                    label: Text(
+                      preset,
+                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                    ),
+                    onPressed: () => _triggerVoiceCommand(preset),
+                  );
+                }).toList(),
+              ),
+              const SizedBox(height: 20),
+            ],
+
+            // Text Input Option
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _customInputController,
+                    style: const TextStyle(color: Colors.white, fontSize: 13),
+                    decoration: InputDecoration(
+                      hintText: state.text('mic_prompt'),
+                      hintStyle: const TextStyle(color: Colors.white30, fontSize: 12),
+                      filled: true,
+                      fillColor: Colors.white.withOpacity(0.04),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        borderSide: BorderSide(color: Colors.white.withOpacity(0.1)),
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        borderSide: const BorderSide(color: Colors.blueAccent),
+                      ),
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    ),
+                    onSubmitted: (val) {
+                      _triggerVoiceCommand(val);
+                      _customInputController.clear();
+                    },
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  style: IconButton.styleFrom(
+                    backgroundColor: Colors.blueAccent,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                  icon: const Icon(Icons.send, color: Colors.white, size: 18),
+                  onPressed: () {
+                    _triggerVoiceCommand(_customInputController.text);
                     _customInputController.clear();
                   },
                 ),
-              ),
-              const SizedBox(width: 8),
-              IconButton(
-                style: IconButton.styleFrom(
-                  backgroundColor: Colors.blueAccent,
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                ),
-                icon: const Icon(Icons.send, color: Colors.white, size: 18),
-                onPressed: () {
-                  _triggerVoiceCommand(_customInputController.text);
-                  _customInputController.clear();
-                },
-              ),
-            ],
-          ),
-        ],
+              ],
+            ),
+          ],
+        ),
       ),
     );
   }
