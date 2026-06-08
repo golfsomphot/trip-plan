@@ -34,6 +34,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   bool _isLoadingRoute = false;
   int _selectedIndex = 0;
   int _rightPanelTabIndex = 0;
+  bool _isVoiceWelcomeVisible = true;
 
   @override
   void initState() {
@@ -334,12 +335,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
       Widget activeBody;
       switch (_selectedIndex) {
         case 0:
+          activeBody = _buildMapPanel(state);
+          break;
+        case 1:
           activeBody = SingleChildScrollView(
             child: _buildTelemetryPanel(state),
           );
-          break;
-        case 1:
-          activeBody = _buildMapPanel(state);
           break;
         case 2:
           activeBody = SingleChildScrollView(
@@ -372,12 +373,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
           },
           items: [
             BottomNavigationBarItem(
-              icon: const Icon(Icons.analytics),
-              label: state.text('telemetry_tab'),
-            ),
-            BottomNavigationBarItem(
               icon: const Icon(Icons.map),
               label: state.text('map_tab'),
+            ),
+            BottomNavigationBarItem(
+              icon: const Icon(Icons.analytics),
+              label: state.text('telemetry_tab'),
             ),
             BottomNavigationBarItem(
               icon: const Icon(Icons.battery_charging_full),
@@ -1343,7 +1344,112 @@ class _DashboardScreenState extends State<DashboardScreen> {
               ],
             ),
           ),
-        )
+        ),
+
+        // 1. Large Glowing Center Voice Assistant Card
+        if (_isVoiceWelcomeVisible)
+          Align(
+            alignment: Alignment.center,
+            child: Container(
+              margin: const EdgeInsets.symmetric(horizontal: 24),
+              padding: const EdgeInsets.all(24),
+              constraints: const BoxConstraints(maxWidth: 320),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1E222A).withOpacity(0.95),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: Colors.white.withOpacity(0.12)),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.4),
+                    blurRadius: 30,
+                    spreadRadius: 2,
+                  )
+                ],
+              ),
+              child: Stack(
+                children: [
+                  Positioned(
+                    right: 0,
+                    top: 0,
+                    child: GestureDetector(
+                      onTap: () {
+                        setState(() {
+                          _isVoiceWelcomeVisible = false;
+                        });
+                      },
+                      child: const Icon(Icons.close, color: Colors.white60, size: 20),
+                    ),
+                  ),
+                  Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const SizedBox(height: 12),
+                      // Pulsing/Glowing mic button
+                      GestureDetector(
+                        onTap: () {
+                          _showVoiceAssistantDialog(state);
+                        },
+                        child: Container(
+                          width: 80,
+                          height: 80,
+                          decoration: BoxDecoration(
+                            color: Colors.blueAccent.withOpacity(0.15),
+                            shape: BoxShape.circle,
+                            border: Border.all(color: Colors.blueAccent, width: 2),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.blueAccent.withOpacity(0.25),
+                                blurRadius: 20,
+                                spreadRadius: 2,
+                              ),
+                            ],
+                          ),
+                          child: const Icon(Icons.mic, color: Colors.blueAccent, size: 36),
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      Text(
+                        state.text('ask_copilot'),
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                          fontFamily: 'Space Grotesk',
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        state.text('copilot_speech_desc'),
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: Colors.white60,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+        // 2. Small Floating Mic Button on bottom right (when center card is hidden)
+        if (!_isVoiceWelcomeVisible)
+          Positioned(
+            bottom: 16,
+            right: 16,
+            child: FloatingActionButton(
+              backgroundColor: Colors.blueAccent,
+              foregroundColor: Colors.white,
+              elevation: 6,
+              shape: const CircleBorder(),
+              onPressed: () {
+                _showVoiceAssistantDialog(state);
+              },
+              child: const Icon(Icons.mic, size: 24),
+            ),
+          ),
       ],
     );
   }
